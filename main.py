@@ -1,12 +1,10 @@
 import tensorflow as tf
-import prettytensor as pt
 from generator import began_generator as generator
 from discriminator import began_discriminator as discriminator
 from utils.misc import loadData, dataIterator
 import tqdm
 import numpy as np
 from utils.misc import plot_gens
-import time
 from config import checkpoint_path, checkpoint_prefix
 
 
@@ -55,9 +53,9 @@ class BEGAN:
             eta = 1  # paper uses L1 norm
             diff = tf.abs(out - inp)
             if eta == 1:
-                return tf.reduce_sum(diff)
+                return tf.reduce_mean(diff)
             else:
-                return tf.reduce_sum(tf.pow(diff, eta))
+                return tf.reduce_mean(tf.pow(diff, eta))
 
         mu_real = pixel_autoencoder_loss(D_real_out, D_real_in)
         mu_gen = pixel_autoencoder_loss(D_gen_out, D_gen_in)
@@ -68,27 +66,25 @@ class BEGAN:
         convergence_measure = mu_real + np.abs(gamma * mu_real - mu_gen)
         return D_loss, G_loss, k_tp, convergence_measure
 
-    def run(x, batch_size, hidden_size):
+    def run(x, batch_size, num_filters, hidden_size, image_size):
         Z = tf.random_normal((batch_size, hidden_size), 0, 1)
 
-        with pt.defaults_scope(learned_moments_update_rate=0.0003,
-                               variance_epsilon=0.001):
+        x_tilde = generator(Z, batch_size=batch_size, num_filters=num_filters,
+                            hidden_size=hidden_size, image_size=image_size)
+        x_tilde_d = discriminator(x_tilde, batch_size=batch_size, num_filters=num_filters,
+                                  hidden_size=hidden_size, image_size=image_size)
 
-            x_tilde = generator(Z, batch_size=batch_size)
-            x_tilde_d = discriminator(x_tilde, batch_size=batch_size,
-                                      hidden_size=hidden_size)
+        x_d = discriminator(x, reuse_scope=True, batch_size=batch_size, num_filters=num_filters,
+                            hidden_size=hidden_size, image_size=image_size)
 
-            x_d = discriminator(x, reuse_scope=True, batch_size=batch_size,
-                                hidden_size=hidden_size)
-
-            return x_tilde, x_tilde_d, x_d
+        return x_tilde, x_tilde_d, x_d
 
     scopes = ['generator', 'discriminator']
 
 
-def began_train(images, start_epoch=0, add_epochs=None, batch_size=16,
-                hidden_size=2048, dim=(64, 64, 3), gpu_id='/gpu:0',
-                demo=False, get=False, start_learn_rate=1e-5, decay_every=50,
+def began_train(num_images=50000, start_epoch=0, add_epochs=None, batch_size=16,
+                hidden_size=64, image_size=64, gpu_id='/gpu:0',
+                demo=False, get=False, start_learn_rate=1e-4, decay_every=100,
                 save_every=1, batch_norm=True, gamma=0.75):
 
     num_epochs = start_epoch + add_epochs
@@ -105,12 +101,14 @@ def began_train(images, start_epoch=0, add_epochs=None, batch_size=16,
             opt = tf.train.AdamOptimizer(learning_rate, epsilon=1.0)
 
             next_batch = tf.placeholder(tf.float32,
-                                        [batch_size, np.product(dim)])
+                                        [batch_size, image_size * image_size * 3])
 
-            x_tilde, x_tilde_d, x_d = BEGAN.run(next_batch, batch_size,
-                                                hidden_size)
+            x_tilde, x_tilde_d, x_d = BEGAN.run(next_batch, batch_size=batch_size, num_filters=128,
+                                                hidden_size=hidden_size, image_size=image_size)
 
-            k_t = tf.placeholder(tf.float32, shape=[])
+            k_t = tf.get_variable('kt', [],
+                                  initializer=tf.constant_initializer(0),
+                                  trainable=False)
             D_loss, G_loss, k_tp, convergence_measure = \
                 BEGAN.loss(next_batch, x_d, x_tilde, x_tilde_d, k_t=k_t)
 
@@ -140,9 +138,10 @@ def began_train(images, start_epoch=0, add_epochs=None, batch_size=16,
                                        str(start_epoch-1).zfill(4))
         tf.train.Saver.restore(saver, sess, path)
 
-    k_t_ = 0  # We initialise with k_t = 0 as in the paper.
-    num_batches_per_epoch = int(len(images) / batch_size)
+    k_t_ = sess.run(k_t)  # We initialise with k_t = 0 as in the paper.
+    num_batches_per_epoch = num_images // batch_size
     for epoch in range(start_epoch, num_epochs):
+        images = loadData(size=num_images)
         print('Epoch {} / {}'.format(epoch + 1, num_epochs + 1))
         for i in tqdm.tqdm(range(num_batches_per_epoch)):
             iter_ = dataIterator([images], batch_size)
@@ -174,27 +173,6 @@ def began_train(images, start_epoch=0, add_epochs=None, batch_size=16,
             return ims
 
 
-def _train(start_epoch, train, add_epochs, max_images=50000, **k):
-    SE = start_epoch
-    while start_epoch <= SE + add_epochs:
-        i = 0
-        while True:
-            images = loadData(size=max_images, offset=i)
-            if train is False:
-                return began_train(images, start_epoch=start_epoch,
-                                   add_epochs=0, demo=True, get=True, **k)
-            began_train(images, start_epoch=start_epoch, add_epochs=1,
-                        **k)
-            start_epoch += 1
-            i += 1
-            if len(images) < max_images:
-                break
-            del images
-            time.sleep(30)  # Let my GPU cool down
-        print('full cycle finished. Good time to stop.')
-        time.sleep(60)
-
-
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Run BEGAN.')
@@ -213,7 +191,7 @@ if __name__ == '__main__':
                         help='Number of epochs to train'
                         + '(-1 to train indefinitely)')
 
-    parser.add_argument('--max-images', type=int, default=50000,
+    parser.add_argument('--num-images', type=int, default=2000,
                         help='Number of images to load into RAM at once')
 
     parser.add_argument('--gamma', type=float, default=0.75,
@@ -230,7 +208,7 @@ if __name__ == '__main__':
                         help='Batch size for training (default 16'
                         + 'as in paper)')
 
-    parser.add_argument('--hidden_size', type=int, default=2048,
+    parser.add_argument('--hidden_size', type=int, default=64,
                         help='Dimensionality of the discriminator encoding.'
                         + '(Paper doesnt specify value so we use guess)')
 
@@ -244,6 +222,9 @@ if __name__ == '__main__':
     parser.add_argument('--outdir', type=str, default='output',
                         help='Path to save output generations')
 
+    parser.add_argument('--image-size', type=int, default=64,
+                        help='Image size (must be 64 or 128)')
+
     args = parser.parse_args()
     if args.gpuid == -1:
         args.gpuid = '/cpu:0'
@@ -253,18 +234,25 @@ if __name__ == '__main__':
     if args.decay_every == -1:
         args.decay_every = np.inf
 
-    if not args.train:
-        args.train = False
+    if args.train:
+        demo = False
+        get = False
+    else:
+        demo = True
+        get = True
+        args.add_epochs = 0
 
-    im = _train(start_epoch=args.start_epoch, add_epochs=args.add_epochs,
+    im = began_train(start_epoch=args.start_epoch, add_epochs=args.add_epochs,
                 batch_size=args.batch_size, hidden_size=args.hidden_size,
-                gpu_id=args.gpuid, train=args.train,
+                gpu_id=args.gpuid, demo=demo, get=get,
+                image_size=args.image_size,
                 save_every=args.save_every, decay_every=args.decay_every,
-                batch_norm=args.batch_norm)
+                batch_norm=args.batch_norm, num_images=args.num_images,
+                start_learn_rate=args.start_learn_rate)
 
     if not args.train:
         import matplotlib.pyplot as plt
         for n in range(8):
-            im_to_save = im[n].reshape([64, 64, 3])
+            im_to_save = im[n].reshape([args.image_size, args.image_size, 3])
             plt.imsave(args.outdir+'/out_{}.jpg'.format(n),
                        im_to_save)
